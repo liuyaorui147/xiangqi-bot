@@ -258,6 +258,13 @@ def snapshot(tries=4, verbose=False, reuse=None):
             time.sleep(0.4)
             continue
         if reuse is not None and not frame_changed(img):
+            # 复用帧同样要同步朝向。BOARD_FLIP 决定 raw_cell() 怎么把归一化
+            # 坐标反变换回屏幕坐标，而它是全局量、只在这里和下面赋值 —— 画面
+            # 静止时走这条捷径直接 return，flip 就会残留上一次的值。换 App
+            # 重新标定、上一局执黑、程序重启都可能让它与画面不符，于是点击
+            # 落到镜像位置，落子前复核永远不过，表现成"一直思考不落子"。
+            if len(reuse) >= 4 and reuse[3] is not None:
+                BOARD_FLIP = reuse[3]
             return img, reuse[1], reuse[2]
         loc = (bl.locate_with_calib(img, CALIB, verbose=verbose)
                or bl.locate_affine(img)
@@ -906,7 +913,10 @@ def _main_impl():
         prev_ok = None       # 上一个被接受的稳定局面，用于"差 2 格"快通道
         boot_wait = None
         weird = 0                # 连续"看不到稳定棋盘"的次数
-        prev_frame = None    # 上一帧 (img, loc, board)，供画面未变时复用
+        stales = 0               # 连续"落子前复核不通过"次数，防止无限循环
+        # 上一帧 (img, loc, board, flip)，供画面未变时复用；flip 必须与 board
+        # 一起带走，否则复用时会沿用旧朝向（见 snapshot 的 reuse 分支）
+        prev_frame = None
         clear_ponder()
         while True:
             # 连续读不到棋盘时打开 verbose，把失败原因（定位失败/校验不过的
@@ -914,12 +924,12 @@ def _main_impl():
             img, loc, board = snapshot(verbose=(refusals > 0 or weird >= 5),
                                        reuse=prev_frame)
             if board is not None:
-                prev_frame = (img, loc, board)
+                prev_frame = (img, loc, board, BOARD_FLIP)
             if board is None:
                 weird += 1
                 print(".", end="", flush=True)
                 if weird >= 8 and handle_possible_game_end(img, weird):
-                    expect, state, weird, refusals = None, "boot", 0, 0
+                    expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
                     last_sig, stable, boot_wait, prev_ok = None, 0, None, None
                     prev_frame = None
                     clear_ponder()
@@ -943,7 +953,7 @@ def _main_impl():
                         print(f"\n[不稳定] 已连续 {weird} 帧局面在变 "
                               f"state={state} 当前={sig[:34]}...", flush=True)
                     if weird >= 12 and handle_possible_game_end(img, weird):
-                        expect, state, weird, refusals = None, "boot", 0, 0
+                        expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
                         last_sig, stable, boot_wait, prev_ok = None, 0, None, None
                         prev_frame = None
                         clear_ponder()
@@ -1017,12 +1027,13 @@ def _main_impl():
                 status, fen_after = play_once_prepared(board, loc, dry=dry)
                 if status == "ok":
                     expect, refusals = fen_after, 0
+                    stales = 0
                     state = "wait_opp"
                 elif status == "mate":
                     # 引擎确认将死（应用无关信号），直接开下一局
                     print("[终局] 自动开下一局")
                     if AUTO_NEXT and click_next_game():
-                        expect, state, weird, refusals = None, "boot", 0, 0
+                        expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
                         last_sig, stable, boot_wait, prev_ok = None, 0, None, None
                         prev_frame = None
                         clear_ponder()
@@ -1031,9 +1042,23 @@ def _main_impl():
                     print("已停止（点击再来一局失败）")
                     return 1
                 elif status == "stale":
-                    # 局面在分析期间变了，下一轮用最新局面重新分析，不计失败
+                    # 局面在分析期间变了，下一轮用最新局面重新分析，不计失败。
+                    # 但"复核一直不过"必须封顶：它不计入 refusals，会变成引擎
+                    # 反复思考、永远不落子的死循环（换 App 重新标定后最容易
+                    # 撞见，界面上看起来就是卡在"思考"里不动）。
                     last_sig = None
                     stable = 0
+                    stales += 1
+                    if stales == 3:
+                        prev_frame = None      # 丢掉复用帧，强制全量重识别
+                        print("\n[诊断] 连续 3 次落子前复核不通过，"
+                              "已强制重新识别棋盘", flush=True)
+                    if stales >= 8:
+                        print("\n连续 8 次落子前复核不通过：识别结果与画面不符\n"
+                              "常见原因：① 换 App 后没点『重新标定』\n"
+                              "          ② 标定用的不是一步未走的新局面\n"
+                              "          ③ 当前不在对局界面。已停止。")
+                        return 1
                 else:
                     refusals += 1
                     if refusals >= 5:
