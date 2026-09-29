@@ -14,9 +14,11 @@
 pip install -r requirements.txt
 
 # 1. 下载 Pikafish 引擎，把可执行文件与权重放进 engine/
+#    方式一（推荐，已打包好，51 MB）：
+#    https://github.com/liuyaorui147/xiangqi-bot/releases/download/v1.0.0/xiangqi-bot-engine-v1.0.0.zip
+#    方式二（官方原版，可自选版本）：
 #    https://github.com/official-pikafish/Pikafish/releases
-#    engine/pikafish.exe
-#    engine/pikafish.nnue
+#    最终需要 engine/pikafish.exe 与 engine/pikafish.nnue 两个文件
 
 # 2. 打开模拟器里的象棋 App，进入一局「一步未走」的新棋界面
 python main.py calib          # 标定棋盘位置、收割棋子模板（失败会自动回滚）
@@ -164,8 +166,10 @@ pyinstaller 象棋AI助手.spec
 
 ## 许可
 
-MIT（见 `LICENSE`）。
+本项目源码为 **MIT**（见 `LICENSE`）。
 
-注意：**本仓库不含 Pikafish 引擎本体**。Pikafish 为 GPL-3.0 授权，需单独从
-[官方仓库](https://github.com/official-pikafish/Pikafish/releases) 获取。
-本项目通过 UCI 子进程接口调用它，二者相互独立。
+**Pikafish 引擎不随源码分发**——它是 GPL-3.0 授权的独立第三方作品，与本项目源码分开发布，仅作聚合分发。依据 GPL-3.0 第 6 条，其完整源码见
+[Pikafish 官方仓库](https://github.com/official-pikafish/Pikafish)。
+
+引擎二进制可从本仓库的
+[Releases 附件](https://github.com/liuyaorui147/xiangqi-bot/releases/tag/v1.0.0)获取，或直接从官方 Release 下载。本项目通过 UCI 子进程接口调用它，二者相互独立，本项目源码不受 GPL 传染。
