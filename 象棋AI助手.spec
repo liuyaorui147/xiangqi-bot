@@ -1,11 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
+
+# Pikafish 引擎本体不进仓库（GPL-3.0），但本地构建时要带进产物。
+# 仓库里没有 engine/ 时自动跳过，不会因为缺目录而构建失败。
+_extra_datas = [('engine', 'engine')] if os.path.isdir('engine') else []
 
 a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('ad_close.png', '.')],
+    datas=[('ad_close.png', '.')] + _extra_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
