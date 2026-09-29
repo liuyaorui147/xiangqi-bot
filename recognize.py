@@ -103,6 +103,13 @@ class Recognizer:
         if x0 < 0 or y0 < 0 or x0 + 2 * r > p["w"] or y0 + 2 * r > p["h"]:
             return None
         hsv = p["hsv"][y0:y0 + 2 * r, x0:x0 + 2 * r]
+        # 只统计中心窗口：棋子的字在中心，而 JJ 象棋会给最新落子沿棋子
+        # 外缘画一圈高亮（红方红圈）。全格统计时红圈像素被算进"红"，
+        # 带圈黑子就被误判成红子（实测：红17黑15，校验永远失败，程序
+        # 一直不落子）。字占棋子中心约一半，取 0.55r 覆盖笔画且避圈。
+        m = max(4, int(r * 0.55))
+        c = hsv.shape[0] // 2
+        hsv = hsv[c - m:c + m, c - m:c + m]
         h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
         rr = float((((h < 8) | (h > 170)) & (s > 90) & (v > 60)).mean())
         dr = float(((s < 120) & (v < 90)).mean())
