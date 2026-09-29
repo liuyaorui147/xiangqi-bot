@@ -4,6 +4,7 @@
 不存在 DPI / 窗口边框 / 遮挡问题。
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -162,9 +163,23 @@ def devices(timeout=10):
     return res
 
 
-def first_device(timeout=10):
-    ds = devices(timeout)
-    for s, st in ds:
+def first_device(timeout=10, auto=True):
+    """返回第一个在线设备的序列号；找不到时返回 None。
+
+    auto=True（默认）会在列表为空时先尝试自动连接模拟器再查一次。
+    不自动重连的话，模拟器或 adb server 一重启就永远"找不到设备"——
+    MuMu 的 adb 端口不在 adb 自动扫描的 5555-5585 区间内，连接记录丢了没人补。
+    """
+    for s, st in devices(timeout):
+        if st == "device":
+            return s
+    if not auto or ADB is None:
+        return None
+    ok, msg = auto_connect(timeout=timeout)
+    if not ok:
+        print(f"[adb] 自动连接模拟器失败: {msg}")
+        return None
+    for s, st in devices(timeout):
         if st == "device":
             return s
     return None
@@ -174,6 +189,93 @@ def connect(host="127.0.0.1", port=5555, timeout=12):
     rc, out, err = _run(["connect", f"{host}:{port}"], timeout=timeout)
     msg = (out.decode("utf-8", "replace") + err.decode("utf-8", "replace")).strip()
     return rc == 0 or "connected" in msg or "already" in msg, msg
+
+
+# --- 模拟器自动发现 -------------------------------------------------------
+# MuMu 的 adb 端口每次启动可能不同（实测见过 16384 / 7555 / 21503），且远在
+# adb 自动扫描范围之外，所以只能问 MuMuManager 要，拿不到再按常见端口试。
+_MUMU_FALLBACK_PORTS = (16384, 7555, 21503, 7556, 5555)
+_MUMU_MANAGER = "MuMuManager.exe"
+
+
+def mumu_manager_path():
+    """定位 MuMuManager.exe；找不到返回 None。"""
+    p = os.environ.get("XIANGQI_MUMU_MANAGER")
+    if p and os.path.exists(p):
+        return p
+    roots = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+             r"D:\Program Files", r"D:\Program Files (x86)"]
+    subs = [os.path.join("Netease", "MuMu"), "MuMu", os.path.join("Netease", "MuMuPlayer")]
+    seen = set()
+    for r in roots:
+        if not r:
+            continue
+        for s in subs:
+            for base in (os.path.join(r, s), r):
+                for rel in (os.path.join("nx_main", _MUMU_MANAGER), _MUMU_MANAGER):
+                    c = os.path.join(base, rel)
+                    if c in seen:
+                        continue
+                    seen.add(c)
+                    if os.path.exists(c):
+                        return c
+    return None
+
+
+def mumu_adb_ports(timeout=8):
+    """向 MuMuManager 查询各实例的 adb 端口，返回已启动实例的端口列表。"""
+    exe = mumu_manager_path()
+    if not exe:
+        return []
+    ports = []
+    for idx in range(4):
+        try:
+            p = subprocess.run([exe, "info", "-v", str(idx)], capture_output=True,
+                               timeout=timeout, creationflags=NO_WINDOW)
+        except (subprocess.TimeoutExpired, OSError):
+            break
+        txt = p.stdout.decode("utf-8", "replace")
+        if not txt.strip():            # 没有这个实例了
+            break
+        flat = txt.replace(" ", "").replace("\n", "")
+        if '"is_process_started"' not in flat:
+            # 管理器没起来（会报 -503）或压根没这个实例。继续问 1/2/3 只会
+            # 白等 4 个超时，设备离线时 GUI 会明显卡一下，所以直接收手。
+            break
+        if '"is_process_started":true' not in flat:
+            continue                   # 实例存在但没启动
+        m = re.search(r'"adb_port"\s*:\s*(\d+)', txt)
+        if m:
+            ports.append(int(m.group(1)))
+    return ports
+
+
+def auto_connect(host="127.0.0.1", timeout=12):
+    """主动连上模拟器。返回 (是否已有在线设备, 说明)。
+
+    只连到第一个成功的端口就停 —— MuMu 会把多个端口映射到同一台设备，
+    都连上的话 adb devices 会出现多条同设备记录，之后所有不带 -s 的
+    adb 命令都会报 "more than one device/emulator"。
+    """
+    if ADB is None:
+        return False, "找不到 adb，无法自动连接"
+
+    for s, st in devices(timeout):
+        if st == "device":
+            return True, f"已有在线设备 {s}"
+
+    known = mumu_adb_ports()          # 只查一次，MuMuManager 启动不便宜
+    tried = []
+    for port in known + [p for p in _MUMU_FALLBACK_PORTS if p not in known]:
+        tried.append(port)
+        ok, msg = connect(host, port, timeout=timeout)
+        if not ok:
+            continue
+        for s, st in devices(timeout):
+            if st == "device":
+                return True, f"已连接 {host}:{port}（设备 {s}）"
+    return False, f"尝试端口 {tried} 均未连上设备"
 
 
 def screencap(serial=None, timeout=15):
