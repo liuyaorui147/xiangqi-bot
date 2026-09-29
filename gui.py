@@ -130,9 +130,9 @@ class App:
         ttk.Button(f, text="保存设置", command=self.on_save).grid(row=0, column=7, **pad)
         self.v_side = tk.StringVar(value=str(self.cfg.get("side", "red")))
         ttk.Label(f, text="我方执子").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Radiobutton(f, text="红（先手）", value="red",
+        ttk.Radiobutton(f, text="红（先手）", value="red", command=self._on_side,
                         variable=self.v_side).grid(row=1, column=1, sticky="w", **pad)
-        ttk.Radiobutton(f, text="黑（后手）", value="black",
+        ttk.Radiobutton(f, text="黑（后手）", value="black", command=self._on_side,
                         variable=self.v_side).grid(row=1, column=2, sticky="w", **pad)
         ttk.Label(f, text="执黑时棋盘会翻转，程序按红帅位置自动摆正",
                   foreground="#666").grid(row=1, column=3, columnspan=5, sticky="w", **pad)
@@ -212,10 +212,27 @@ class App:
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.status_var.set("状态：运行中")
-        self.thread = threading.Thread(target=self._run_bot, args=args, daemon=True)
+        # tkinter 变量必须在主线程读取：放到子线程里 get() 可能拿到空串，
+        # 于是 MY_SIDE 被 `or "red"` 兜底 —— 界面明明选了黑方，跑起来却是
+        # 红方（选完重启又变回红，正是这个值没落盘）。这里取好再传进去。
+        side = self.v_side.get() or "red"
+        self.thread = threading.Thread(target=self._run_bot, args=(side, *args),
+                                       daemon=True)
         self.thread.start()
 
-    def _run_bot(self, *args):
+    def _on_side(self):
+        """切换执红/执黑立即落盘。
+
+        单选按钮只改内存里的变量，不写配置的话下次启动界面又显示成
+        bot_config.json 里的旧值（用户看到的就是"明明选了黑，重启变红"）。
+        """
+        self.cfg["side"] = self.v_side.get()
+        try:
+            save_cfg(self.cfg)
+        except Exception:
+            pass
+
+    def _run_bot(self, side, *args):
         """在界面进程内跑主程序，输出重定向到日志队列。"""
         try:
             sys.path.insert(0, HERE)
@@ -223,7 +240,7 @@ class App:
             import main
             main.STOP.clear()
             # 界面上选了就立刻生效，不必先点保存（保存只影响下次启动）
-            main.MY_SIDE = self.v_side.get() or "red"
+            main.MY_SIDE = side
             sys.argv = ["main.py", *args]
             self.q.put(("line", f"$ 启动 {' '.join(args)}"))
             old = sys.stdout
