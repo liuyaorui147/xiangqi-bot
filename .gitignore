@@ -1,0 +1,40 @@
+# 依赖产物与本地缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller 打包产物（每个约 230 MB）
+dist/
+build/
+*.manifest
+
+# 调试截图、日志、临时产物
+shots/
+*.log
+*.tmp
+
+# Pikafish 引擎本体与 NNUE 权重（第三方，体积 56 MB）
+# 请到官方 Release 下载后放进 engine/
+# https://github.com/official-pikafish/Pikafish/releases
+engine/
+*.7z
+*.zip
+*.nnue
+
+# 标定产物：换 App 或换皮肤后由 `python main.py calib` 现场重新生成
+templates/
+board_calib.json
+color_ref.json
+
+# 本地 private 覆盖配置（不进仓库）
+local_config.json
+*.local.json
+
+# 操作系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,6 @@
+# 本项目只有两个第三方依赖，其余全部使用 Python 标准库实现。
+# GUI 基于内置 tkinter，无需安装。
+# MuMu 模拟器截图/点击通过 ctypes 直调官方 SDK，无需 pywin32。
+
+numpy>=2.0
+opencv-python>=4.10

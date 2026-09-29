@@ -1,0 +1,17 @@
+{
+ "side": "red",
+ "think_ms": 350,
+ "threads": 0,
+ "hash_mb": 256,
+ "poll": 0.04,
+ "poll_idle": 0.12,
+ "boot_wait": 2.5,
+ "mate_depth": 2,
+ "ponder": true,
+ "ponder_max_ms": 3000,
+ "move_settle": 0.35,
+ "tap_gap": 0.08,
+ "mumu_tap": true,
+ "wait_max": 90,
+ "auto_next": true
+}
