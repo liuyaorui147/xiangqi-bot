@@ -1,5 +1,5 @@
 {
- "side": "red",
+ "side": "auto",
  "think_ms": 350,
  "threads": 0,
  "hash_mb": 256,
@@ -13,5 +13,8 @@
  "tap_gap": 0.08,
  "mumu_tap": true,
  "wait_max": 90,
- "auto_next": true
+ "auto_next": true,
+ "auto_side": true,
+ "eval_ms": 1500,
+ "eval_on_wait": true
 }
