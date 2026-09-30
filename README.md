@@ -173,3 +173,10 @@ pyinstaller 象棋AI助手.spec
 
 引擎二进制可从本仓库的
 [Releases 附件](https://github.com/liuyaorui147/xiangqi-bot/releases/tag/v1.0.0)获取，或直接从官方 Release 下载。本项目通过 UCI 子进程接口调用它，二者相互独立，本项目源码不受 GPL 传染。
+
+---
+
+## 更新历史
+
+完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。最近一次更新（2026-09-30）主要做了三件事：
+开始界面自动点「10 分钟场」开局、执子方自动判定、修掉一批导致胜率乱报与识别卡死的问题。
