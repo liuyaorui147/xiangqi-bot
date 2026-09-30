@@ -26,7 +26,10 @@ engine/
 *.nnue
 
 # 标定产物：换 App 或换皮肤后由 `python main.py calib` 现场重新生成
-templates/
+templates/*
+# 例外：场次按钮模板是手工裁剪的代码级资源，不随 App 变化，必须随仓库分发
+# （漏掉它打包版就点不了开始界面的「10分钟场」）
+!templates/arena_10.png
 board_calib.json
 color_ref.json
 
@@ -38,3 +41,6 @@ local_config.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 运行日志（每次启动生成一份，不该进仓库）
+logs/

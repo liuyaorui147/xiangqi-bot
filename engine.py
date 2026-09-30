@@ -99,12 +99,28 @@ def parse_info(line):
             d["score"] = t[i + 2] if i + 2 < len(t) else ""
             i += 3
             continue
+        if k == "wdl":
+            # "wdl 123 456 421" 是三个数（胜/和/负的千分数），通用解析只会
+            # 取到第一个。这里要一次性收三个，否则胜率算出来都是赢。
+            try:
+                d["wdl"] = tuple(int(x) for x in t[i + 1:i + 4])
+            except (ValueError, IndexError):
+                pass
+            i += 4
+            continue
         if k == "pv":
             d["pv"] = " ".join(t[i + 1:])
             break
         if i + 1 < len(t):
             d[k] = t[i + 1]
         i += 2
+    # aspiration 窗口搜索失败后重搜会给出 upperbound/lowerbound：
+    # 那不是真实分数，只是"真实值不超过/不低于它"。拿它算胜率会系统性偏
+    # 高或偏低，必须标记出来让调用方跳过。
+    if "upperbound" in t:
+        d["bound"] = "upper"
+    elif "lowerbound" in t:
+        d["bound"] = "lower"
     return d
 
 
@@ -237,6 +253,9 @@ class Engine:
         self.ponder_enabled = self._want_ponder and "Ponder" in self.options
         opts = [("Threads", self.threads), ("Hash", self.hash_mb),
                 ("Ponder", "true" if self.ponder_enabled else "false")]
+        # 开 WDL（胜/和/负千分数）：这是引擎自己的胜负模型，比拿 cp 反推
+        # 胜率准得多。引擎不支持时下面的 in options 判断会自动跳过。
+        opts.append(("UCI_ShowWDL", "true"))
         # 本地管道延迟不到 1ms，默认 30ms 的 move overhead 是给网络对弈留的
         if "Move Overhead" in self.options:
             opts.append(("Move Overhead", self.move_overhead))
@@ -310,13 +329,23 @@ class Engine:
         """从一批输出行里取出 bestmove、最后一条 info，以及该 info 的原文。
 
         原文要单独留着：bestmove 行里没有 pv，取预测应手只能从 info 行取。
+
+        info 取"最后一条不带 bound 的行"：带 upperbound/lowerbound 的是
+        窗口重搜的边界值，不是真实分数。只有全部带 bound 时才退回最后一条
+        （总比没有强），并保留 bound 标记让调用方知道这个分数不可靠。
         """
         bm, info, info_line = None, {}, ""
+        last_any = ({}, "")
         for l in out:
             if l.startswith("bestmove"):
                 bm = l.split()[1] if len(l.split()) > 1 else None
             elif l.startswith("info ") and " score " in l:
-                info, info_line = parse_info(l), l
+                d = parse_info(l)
+                last_any = (d, l)
+                if not d.get("bound"):
+                    info, info_line = d, l
+        if not info:
+            info, info_line = last_any
         if not info and info_seed:
             info, info_line = parse_info(info_seed), info_seed
         return bm, info, info_line
@@ -345,7 +374,8 @@ class Engine:
         return bm, {"info": info, "raw": out[-1] if out else "", "timeout": timed_out,
                     "ponder": _ponder_from_pv(info_line)}
 
-    def analyse(self, fen, movetime=300, moves=None, retries=1, depth=None):
+    def analyse(self, fen, movetime=300, moves=None, retries=1, depth=None,
+                timeout=None):
         """带自愈重试的分析：无 bestmove 时 go() 内部已重启引擎，再试一次。
 
         depth 不为 None 时按固定深度搜索（忽略 movetime），用于将死检测这类
@@ -359,8 +389,10 @@ class Engine:
         # depth 路径（将死检测）每步都跑，正常只要 1ms 级；但引擎对非法局面
         # 是**静默不响应**的，超时给 5s 就意味着每步白卡 5 秒、加重试 10 秒。
         # 中局识别抖动更容易喂进非法 FEN，这里必须收紧。
-        timeout = (max(movetime / 1000.0 * 4, movetime / 1000.0 + 3.0)
-                   if depth is None else 1.5)
+        #   movetime 路径：给足搜索时间的余量，但不能太宽 ...
+        timeout = timeout if timeout is not None else (
+            max(movetime / 1000.0 * 4, movetime / 1000.0 + 3.0)
+            if depth is None else 1.5)
         self.set_position(fen, moves)
         bm, res = self.go(movetime=None if depth is not None else movetime,
                           depth=depth, timeout=timeout)

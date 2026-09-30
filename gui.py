@@ -134,6 +134,9 @@ class App:
                         variable=self.v_side).grid(row=1, column=1, sticky="w", **pad)
         ttk.Radiobutton(f, text="黑（后手）", value="black", command=self._on_side,
                         variable=self.v_side).grid(row=1, column=2, sticky="w", **pad)
+        # 挂机用：App 每局先后手不一定，交给程序按"开局谁先落子"自动判定
+        ttk.Radiobutton(f, text="自动判定", value="auto", command=self._on_side,
+                        variable=self.v_side).grid(row=1, column=3, sticky="w", **pad)
         ttk.Label(f, text="执黑时棋盘会翻转，程序按红帅位置自动摆正",
                   foreground="#666").grid(row=1, column=3, columnspan=5, sticky="w", **pad)
         ttk.Label(f, text="思考时间越长棋力越强：350ms≈18-20层，1s≈20层",
@@ -148,8 +151,9 @@ class App:
         self.btn_calib = ttk.Button(f, text="重新标定(换 App)", command=self.on_calib)
         self.btn_refresh = ttk.Button(f, text="刷新状态", command=self.refresh_status)
         self.btn_open = ttk.Button(f, text="打开目录", command=self.on_open_dir)
+        self.btn_log = ttk.Button(f, text="日志文件", command=self.on_open_log)
         for b in (self.btn_start, self.btn_stop, self.btn_once, self.btn_calib,
-                  self.btn_refresh, self.btn_open):
+                  self.btn_refresh, self.btn_open, self.btn_log):
             b.pack(side="left", padx=4)
 
     def _build_board(self):
@@ -159,6 +163,16 @@ class App:
         self.board.pack(side="left", fill="both", expand=True)
         right = ttk.Frame(f)
         right.pack(side="left", fill="y", padx=6)
+        # 胜率：数值 + 进度条一眼看清赢面，下面一行是阶段/残局提醒
+        self.wr_var = tk.StringVar(value="胜率 —")
+        ttk.Label(right, textvariable=self.wr_var, font=("Consolas", 15, "bold"),
+                  foreground="#2d7d46").pack(anchor="w")
+        self.wr_bar = ttk.Progressbar(right, orient="horizontal", length=200,
+                                      mode="determinate", maximum=100)
+        self.wr_bar.pack(anchor="w", pady=(2, 2))
+        self.phase_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.phase_var, font=("Microsoft YaHei", 9, "bold"),
+                  foreground="#c0392b").pack(anchor="w")
         ttk.Label(right, text="引擎着法", font=("Microsoft YaHei", 10, "bold")).pack(anchor="w")
         self.move_var = tk.StringVar(value="—")
         ttk.Label(right, textvariable=self.move_var, font=("Consolas", 16),
@@ -170,6 +184,9 @@ class App:
         ttk.Label(right, text="FEN", foreground="#666").pack(anchor="w", pady=(8, 0))
         ttk.Label(right, textvariable=self.fen_var, wraplength=240,
                   font=("Consolas", 7), foreground="#555").pack(anchor="w")
+        self.log_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.log_var, wraplength=240,
+                  font=("Consolas", 7), foreground="#888").pack(anchor="w", pady=(8, 0))
 
     def _build_log(self):
         f = ttk.LabelFrame(self.root, text="运行日志", padding=4)
@@ -209,6 +226,10 @@ class App:
         self.moves = 0
         self.cnt_var.set("0")
         self.move_var.set("—")
+        self.wr_var.set("胜率 —")
+        self.wr_bar["value"] = 0
+        self.phase_var.set("")
+        self.log_var.set("")
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.status_var.set("状态：运行中")
@@ -240,7 +261,11 @@ class App:
             import main
             main.STOP.clear()
             # 界面上选了就立刻生效，不必先点保存（保存只影响下次启动）
-            main.MY_SIDE = side
+            # side="auto"：交给程序按开局先后手自动判定；显式选红/黑则锁死，
+            # 不让自动判定覆盖掉用户的选择。
+            main.MY_SIDE = side if side in ("red", "black") else "red"
+            main.AUTO_SIDE = (side == "auto")
+            main.SIDE_LOCK = None
             sys.argv = ["main.py", *args]
             self.q.put(("line", f"$ 启动 {' '.join(args)}"))
             old = sys.stdout
@@ -286,6 +311,21 @@ class App:
         elif "引擎建议" in line:
             tag = "hi"
             self.move_var.set(line.split("走")[-1].strip() or "—")
+        elif line.startswith("胜率:"):
+            # "胜率: 62.3%   评估 +85   残局（6子/4大子）"
+            tag = "hi"
+            try:
+                pct = float(line[len("胜率:"):].strip().split("%")[0])
+                self.wr_var.set(f"胜率 {pct:.1f}%")
+                self.wr_bar["value"] = max(0.0, min(100.0, pct))
+            except ValueError:
+                pass
+            # 剩下的 "评估 +85  残局（6子/4大子）" 压成一行：页面窄，不能换行
+            tail = " ".join(line.split("%", 1)[-1].replace("评估", "").split())
+            if tail:
+                self.phase_var.set(tail)
+        elif line.startswith("日志文件:"):
+            self.log_var.set(line.split(":", 1)[1].strip())
         elif "FEN:" in line:
             self.fen_var.set(line.split("FEN:")[-1].strip())
         elif "轮到我方" in line:
@@ -333,6 +373,14 @@ class App:
     def on_open_dir(self):
         try:
             os.startfile(HERE)
+        except Exception:
+            pass
+
+    def on_open_log(self):
+        """打开日志目录。点到这里我们本来就让主程序打印了文件路径。"""
+        try:
+            os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)
+            os.startfile(os.path.join(HERE, "logs"))
         except Exception:
             pass
 

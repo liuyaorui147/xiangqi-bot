@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 import adb as adbmod
+import advice
 import board_locator as bl
 import capture as cap
 import clicker as clk
@@ -25,15 +26,33 @@ from recognize import Recognizer, board_diagram, moved_fen, to_fen, validate_boa
 
 WINDOW = "天天象棋"
 MY_SIDE = "red"          # 用户执红
+SIDE_FLIPS = [0]         # 本局执子方换边次数，用于僵局熔断
+SIDE_GUESS = [False]     # 朝向先验是否已用过（每局只定一次，避免反复改判）
 THINK_MS = 350           # 思考时间（要更强可适当调大）
 POLL = 0.35              # 轮询间隔
 BOOT_WAIT = 2.5          # 新局开局观察窗口（等对手先动，黑先时对方会先落子）
+BOOT_PATIENCE = 12.0     # 判黑（我方后手）时，最多再耐心等多久对手先落子
 MATE_DEPTH = 2           # 将死检测的搜索深度（有无合法着法第 1 层就看清，2 留余量）
+MATE_SEARCH_DEPTH = 8    # 残局找强制杀的搜索深度（固定深度，够看清连杀即可）
 USE_PONDER = True        # 我方落子后让引擎后台预搜索对手应手（不降棋力，命中即省）
 
 PONDER = {"move": None, "expect": None}   # 后台预搜索的对手应手 + 命中后应有的局面
 PENDING = [None]                          # 命中后取回的 (bestmove, res, fen_body)
 PONDER_STAT = [0, 0]                      # [命中数, 尝试数]，命中率决定实际收益
+# 同一手连续"落子未生效"的记录。counter>=1 时下一次点击前要先复位 UI 的选中态，
+# 否则第二次同样的两次点击会把刚到位的子又走回去（有状态的棋类 UI 通病）。
+MISS_STAT = {"move": None, "count": 0}
+CONFIRMED = [False]                       # 上一手是否真的确认落到新格（自动执子锁定用）
+_LAST_FAIL = [""]                         # 上次打印的校验失败原因（同原因不重复刷屏）
+FORCE_RESNAP = [False]                    # 引擎拒局后要求主循环丢帧重新识别
+MISS_HEAL = [0]                           # 连续"落子未生效"的自愈轮数，攒够才认输
+
+# 自动判定我方执红/执黑（长时间挂机必需：App 每局先后手不固定，写死红方会
+# 落到"给对手的着法 + 点击被拒"）。关闭条件：命令行 --red/--black 显式指定，
+# 或 bot_config.json 里 "auto_side": false。判定成功后 SIDE_LOCK 锁定，
+# 每局结束开新局时会解锁重判。
+AUTO_SIDE = True
+SIDE_LOCK = None
 
 
 def clear_ponder():
@@ -50,6 +69,146 @@ def clear_ponder():
             eng.ponder_miss()
     except Exception:
         pass
+
+
+def apply_side(side, reason, lock=False):
+    """切换 / 确认我方执子方。
+
+    MY_SIDE 决定喂给引擎的走子方（w/b）以及"哪些子算我方的"，判错会让引擎
+    给出对手的着法、点击被 App 拒绝，表现为反复"落子未生效"直到停机。挂机时
+    每局先后手由 App 决定，写死成红方不可靠，所以这里做自动判定：
+      先验   棋盘朝向——App 通常把我方摆在屏幕下方（board 已归一化成"红在下"，
+             flip=True 说明屏幕上是"红在上、黑在下"，于是先验为执黑）
+      定案   开局谁先落子——红先手是规则级信号，不受界面摆法影响
+      校验   首手确实下去之后锁定；若某手连续失败则怀疑判反，自动换边
+    换边必须清掉后台预搜索：残留结果属于旧局面，也可能属于另一方。
+    """
+    global MY_SIDE, SIDE_LOCK
+    side = "black" if side == "black" else "red"
+    if MY_SIDE == side and (not lock or SIDE_LOCK == side):
+        if lock:
+            SIDE_LOCK = side
+        return MY_SIDE
+    MY_SIDE = side
+    # 换边计数：红↔黑来回横跳却始终落不下子，说明根本不在对局页（实测卡在
+    # 结算动画的棋盘残影上，29 子的残局照样能过校验）。攒够了就熔断。
+    SIDE_FLIPS[0] += 1
+    clear_ponder()
+    if lock:
+        SIDE_LOCK = side
+        SIDE_FLIPS[0] = 0        # 首手已确认生效，僵局风险解除
+        SIDE_GUESS[0] = False
+    tag = "红（先手）" if side == "red" else "黑（后手）"
+    tail = "" if SIDE_LOCK else "，待首手生效后确认"
+    print(f"[执子] {tag}  依据：{reason}{tail}", flush=True)
+    return MY_SIDE
+
+
+def report_winrate(info, board, flip, tag="", deep=False):
+    """算胜率并输出。返回平滑后的显示值（0~1），算不出来返回 None。
+
+    三层保障，缺一层都会出现"胜率 100%"这种假象：
+      1. flip —— info 是对手走子方视角时必须翻转，否则我方大优会报成接近 0；
+      2. 子力自洽 —— 评估分超出局面子力能解释的范围就是识别错帧，丢弃；
+      3. 平滑 —— 单帧最多挪 20%，避免错帧和浅搜抖动把曲线打飞。
+
+    "胜率:" 前缀是 GUI 的解析约定，不能改。
+    """
+    if not info:
+        return None
+    ok, why = advice.eval_credible(board, info, MY_SIDE)
+    if not ok:
+        # 结算动画、弹窗期间会连续读到垃圾局面，不节流的话一秒刷好几条。
+        # 每 10 秒最多报一次，其余静默丢弃——胜率仍然保持上一个可信值。
+        global _WR_REJECT_T
+        if time.time() - _WR_REJECT_T >= 10:
+            _WR_REJECT_T = time.time()
+            print(f"  [胜率] 本帧不可信：{why}")
+        return WR_SMOOTHER.value
+    raw = advice.win_percent(info, flip=flip, board=board, my_side=MY_SIDE,
+                             strict=True)
+    if raw is None:
+        return WR_SMOOTHER.value
+    LAST_WR_RAW[0] = raw
+    shown = WR_SMOOTHER.update(raw)
+    ev = advice.eval_text(info)
+    if flip:
+        # 显示给人的评估值也要跟着翻：否则"我方大优"会显示成负分
+        try:
+            if info.get("scoretype") == "cp":
+                ev = f"{'+' if int(info['score']) <= 0 else ''}{-int(info['score'])}"
+            elif info.get("scoretype") == "mate":
+                ev = f"M{-int(info['score'])}"
+        except (TypeError, ValueError):
+            pass
+    extra = ""
+    if abs(shown - raw) > 0.02:
+        extra = f"  (平滑前 {raw * 100:.1f}%)"
+    if info.get("bound"):
+        extra += f"  [{info['bound']}bound，仅供参考]"
+    print(f"胜率: {shown * 100:.1f}%   评估 {ev}   "
+          f"{tag}{'深度评估' if deep else ''}{extra}")
+    return shown
+
+
+def deep_eval_on_wait(fen_body, board_after, opp_to_move=True, dry=False):
+    """等对手落子期间做一次深度评估，把胜率算准。
+
+    时机：我方刚落子、画面进入静止等待。此时 CPU 和引擎都闲着，而对局
+    节奏一点不受影响（人类/对手随时可能落子，我们会立刻中断等待转去搜索）。
+
+    注意视角：我方落子后轮到对手走，FEN 的走子方是对手，所以引擎给出的
+    score/wdl 是**对手视角**，必须 flip 成我方胜率——这正是漏翻转会报出
+    反向胜率的地方。
+
+    中途对手落子会打断这次评估（主循环发现画面变化后会切走），此时结果
+    作废，不会污染显示。
+    """
+    if not EVAL_ON_WAIT or ENGINE is None or dry:
+        return
+    # 走子方必须按"谁走"算出来，不能写死成 'b'。原来写死成黑走，隐含假设
+    # "对手总是黑方"——我方执黑时对手是红，这里就成了我方走子方，引擎给的
+    # 是我方视角的分数，下面 flip=True 再翻一次，方向彻底反过来：实战日志里
+    # 出现"评估 -6191、平滑前 0.0%"一路走低，实际是我方大优（执黑时那串
+    # 深搜数值符号全是反的）。
+    mine_ch = "w" if MY_SIDE == "red" else "b"
+    side_ch = ("b" if mine_ch == "w" else "w") if opp_to_move else mine_ch
+    fen = f"{fen_body} {side_ch} - - 0 1"
+    try:
+        # go() 内部会先停掉后台 ponder，不用在这里手动干预。
+        # retries=0：评估失败不值得重启引擎（那要重加载 NNUE，卡好几秒）。
+        _bm, res = ENGINE.analyse(fen, movetime=EVAL_MS, retries=0,
+                                  timeout=EVAL_MS / 1000.0 * 2 + 1.0)
+    except Exception as e:
+        print(f"  [深度评估] 失败: {type(e).__name__}: {e}")
+        return
+    if res.get("timeout") or not res.get("info"):
+        print("  [深度评估] 引擎无响应，沿用常规搜索的胜率")
+        return
+    d = res["info"].get("depth", "?")
+    report_winrate(res["info"], board_after, flip=True, tag=f"{d}层 ", deep=True)
+
+
+def neutral_tap(loc):
+    """点棋盘外侧一处空白，复位上一次点击可能留下的"选中棋子"状态。
+
+    棋类 App 的点击是有状态的：误判"落子未生效"后按同一对坐标再走一遍，第二
+    次的 tap 会把刚到位的子重新选中，第三下点回去就把它走回原地。日志里
+    h0g2 连点 8 次就是这么来的。事先点一下棋盘格之外的空白，能把这个状态机
+    拉回中性。取点在棋盘左上角外侧，坐标不合法（出屏）时宁可不动手。
+    """
+    pts = loc.get("points") if loc else None
+    if not pts or "cell_x" not in loc:
+        return False
+    x0, y0 = pts[(0, 0)]
+    x, y = x0 - loc["cell_x"] * 0.6, y0 - loc["cell_y"] * 0.6
+    if x < 4 or y < 4:
+        return False
+    click_point(x, y)
+    time.sleep(TAP_GAP)
+    return True
+
+
 MOVE_SETTLE = 0.35       # 落子后的动画等待上限（轮询到落定即提前返回）
 TAP_GAP = 0.10           # 起点与终点两次点击的间隔
 MUMU_TAP = True          # MuMu SDK 触摸点击（比 adb tap 快 4 倍且更稳，失败自动回退）
@@ -84,6 +243,7 @@ if _os.path.exists("bot_config.json"):
 THINK_MS = int(_CFG.get("think_ms", THINK_MS))
 POLL = float(_CFG.get("poll", POLL))
 BOOT_WAIT = float(_CFG.get("boot_wait", BOOT_WAIT))
+BOOT_PATIENCE = float(_CFG.get("boot_patience", BOOT_PATIENCE))
 MATE_DEPTH = int(_CFG.get("mate_depth", MATE_DEPTH))
 USE_PONDER = bool(_CFG.get("ponder", USE_PONDER))
 MOVE_SETTLE = float(_CFG.get("move_settle", MOVE_SETTLE))
@@ -98,12 +258,31 @@ ENGINE_HASH = int(_CFG.get("hash_mb", 256))
 # 高概率窗口，之后 CPU 自动归零。
 # 执红 / 执黑。执黑时棋盘朝向由 orient_board() 自动摆正，这里只决定
 # 走子方（w/b）和"哪些子是我方的"。命令行 --black 可临时覆盖。
-MY_SIDE = str(_CFG.get("side", MY_SIDE)).lower()
+# 配置里 side 允许写 "auto"：交给 AUTO_SIDE 自动判定（挂机场景）。
+_side_cfg = str(_CFG.get("side", MY_SIDE)).lower()
+MY_SIDE = _side_cfg if _side_cfg in ("red", "black") else MY_SIDE
+AUTO_SIDE = bool(_CFG.get("auto_side", AUTO_SIDE))
 PONDER_MAX_MS = int(_CFG.get("ponder_max_ms", 3000))
 # 等对手落子时的采样间隔。画面这段时间本就静止，25Hz 采样纯属浪费：
 # frame_changed 一次约 9ms CPU，25 次/秒就是两成单核。降到 ~8Hz，
 # 发现落子最多晚 80ms，几乎无感。
 POLL_IDLE = float(_CFG.get("poll_idle", 0.12))
+# 胜率专用深度评估：与"选着搜索"分开跑。
+# 选着为了抢时间只有 350ms（约 15~18 层），复杂局面下分数会抖好几个百分点；
+# 胜率是要给人看的，值得多花时间。等对手落子时我们有几十秒空闲，拿 1.5s
+# 做一次深搜，既不影响节奏又能拿到稳定得多的 WDL。
+# 这里必须用 movetime 而不是固定深度：depth 22 在中局可能跑几十秒，
+# 而 analyse 一旦超时会重启引擎（重新加载 48MB NNUE，卡好几秒），
+# 反而拖慢对局。movetime 保证引擎按时返回着法，超时不会发生。
+EVAL_MS = int(_CFG.get("eval_ms", 1500))
+EVAL_ON_WAIT = bool(_CFG.get("eval_on_wait", True))
+# 扫「再来一局」按钮的间隔。结算页会停留很久，不必高频；太密则白白多做
+# 几次颜色判定（每次约十几毫秒）。
+END_CHECK_GAP = float(_CFG.get("end_check_gap", 2.0))
+# 胜率平滑器：抗识别抖动 + 抗浅搜抖动，见 advice.WinRateSmoother
+WR_SMOOTHER = advice.WinRateSmoother()
+LAST_WR_RAW = [None]     # 最近一次可信的原始胜率，供日志对照
+_WR_REJECT_T = 0.0       # 上次打印"本帧不可信"的时间（节流，避免刷屏）
 
 
 def init_backend(prefer_adb=True):
@@ -239,6 +418,28 @@ def raw_cell(cell):
     return (8 - i, 9 - j) if BOARD_FLIP else cell
 
 
+LAST_SNAP_REASON = ""    # 上一次 snapshot 失败的具体原因，供主循环区分"等待态"
+
+
+def is_empty_board_wait(reason=""):
+    """是不是"棋盘存在但没棋子 / 压根没棋盘"的等待态。
+
+    每次开局、每次自动续局都要经过"匹配中 → 摆子中"这段，此时画面上要么
+    没有棋盘、要么是空棋盘。旧代码把这种帧当成异常局面，每 2 秒打一条
+    [校验失败]、还累加 weird，攒够 8 次又去跑结算页检测（一次约 30 秒）。
+    结果是每次续局都空转刷屏几十秒——挂机场景下一局接一局，白白浪费。
+
+    判据：连王都没有。终局结算页是有棋子的（王还在），所以不会误判成等待态。
+    """
+    r = reason or LAST_SNAP_REASON
+    if not r:
+        return False
+    if "定位失败" in r:
+        return True          # 连棋盘都找不到 → 不在对局画面
+    # "王数量异常 K=0 k=0"：格子读到了但一个王都没有 → 空棋盘/摆子中
+    return "K=0" in r and "k=0" in r
+
+
 def snapshot(tries=4, verbose=False, reuse=None):
     """抓一张 -> 定位 -> 识别 + 合法性校验。返回 (img, loc, board)。
 
@@ -249,9 +450,10 @@ def snapshot(tries=4, verbose=False, reuse=None):
 
     返回的 board 已归一化成"红在下"，像素坐标仍要用 raw_cell() 反变换后取。
     """
-    global BOARD_FLIP
+    global BOARD_FLIP, LAST_SNAP_REASON
     img = None
     last_reason = ""
+    LAST_SNAP_REASON = ""
     for k in range(tries):
         img = grab()
         if img is None:
@@ -280,8 +482,13 @@ def snapshot(tries=4, verbose=False, reuse=None):
         if ok:
             return img, loc, board
         last_reason = reason
-        if verbose:
+        LAST_SNAP_REASON = reason
+        # 节流：结算页/摆子动画期每一帧都是"王数量异常"，逐帧打印会把日志
+        # 刷爆（实测一局 11 条），真正有用的信息反而看不见。同一种原因连续
+        # 出现只报一次，原因变了才再报。
+        if verbose and reason != _LAST_FAIL[0]:
             print(f"  [校验失败] {reason}")
+        _LAST_FAIL[0] = reason
         time.sleep(0.6)
     if verbose and last_reason:
         print(f"  [snapshot] {tries} 次均失败: {last_reason}")
@@ -468,10 +675,15 @@ def opponent_mated(fen_full):
     return bm == "(none)"
 
 
-def green_button(img=None, min_area=500):
+def green_button(img=None, min_area=500, max_area=None, min_y_ratio=None):
     """找结算框上的绿色按钮（JJ象棋「再来一局」为绿底白字）。
 
-    返回 (cx, cy, 面积) 或 None。结算框消失后返回 None，可用来验证点击是否生效。
+    返回 (面积, cx, cy) 或 None。结算框消失后返回 None，可用来验证点击是否生效。
+
+    max_area / min_y_ratio 是给"主动扫结算页"用的收紧条件。纯颜色判定太粗，
+    实测对局界面里有面积 5000+、位置偏上的绿色元素会被误判成结算按钮，
+    于是 bot 在对局中连点好几下。结算页那个按钮的实测特征：
+    面积 600~1500、中心 y 约在屏幕 0.89 处（很靠下）。
     """
     if img is None:
         img = grab()
@@ -485,10 +697,17 @@ def green_button(img=None, min_area=500):
         n, _, stats, cent = cv2.connectedComponentsWithStats(low, 8)
         best = None
         for i in range(1, n):
-            if stats[i][4] > min_area:
-                cand = (float(stats[i][4]), float(cent[i][0]), float(cent[i][1]) + h * 0.6)
-                if best is None or cand[0] > best[0]:
-                    best = cand
+            area = float(stats[i][4])
+            if area <= min_area:
+                continue
+            cy = float(cent[i][1]) + h * 0.6
+            if max_area is not None and area > max_area:
+                continue
+            if min_y_ratio is not None and cy < h * min_y_ratio:
+                continue
+            cand = (area, float(cent[i][0]), cy)
+            if best is None or cand[0] > best[0]:
+                best = cand
         return best
     except Exception:
         return None
@@ -498,6 +717,105 @@ def flipped_initial():
     """初始局面从黑方视角看的 FEN（万一新局轮黑先、App 翻转棋盘）。"""
     rows = INITIAL_FEN.split("/")[::-1]
     return "/".join(r.swapcase() for r in rows)
+
+
+def is_initial_position(fen):
+    """是否"一步未走"的开局局面（容忍 1~3 格识别噪声）。
+
+    摆子刚完成时经常有一两个子被认到邻格——实测开局把红炮认到了 e2（标准
+    是 b2/h2），于是严格判 `sig == INITIAL_FEN` 失败，开局观察期被整个跳过，
+    bot 立刻按朝向先验出手，在对手还没走时抢先落子（未生效）。所以这里按
+    字符一致率判定，差 3 个字符以内仍算开局。
+    """
+    if not fen:
+        return False
+    body = fen.split(" ")[0] if " " in fen else fen
+    # 先卡满编：中局/残局子数必然少于 32，单靠字符差异会把"只差 3 个字符"
+    # 的中局也误判成开局（实测踩过）。一个子被认到邻格会产生 2~4 个字符
+    # 差异，所以满编之后再放宽到 8 个字符。
+    if sum(1 for ch in body if ch.isalpha()) != 32:
+        return False
+    for ref in (INITIAL_FEN, flipped_initial()):
+        if body == ref:
+            return True
+        if len(body) != len(ref):
+            continue
+        ok = sum(1 for a, b in zip(body, ref) if a == b)
+        if len(ref) - ok <= 8:
+            return True
+    return False
+
+
+ARENA_TPL = [None]       # 「10分钟」按钮模板灰度图缓存（None=未加载, False=加载失败）
+
+
+def find_arena_10(img=None, min_score=0.75):
+    """在开始界面找「10分钟」场次按钮（模板匹配，多尺度）。返回 (x,y) 或 None。
+
+    排位开始界面底部有一排金色场次按钮（5分钟/10分钟/15分钟/超快），
+    「10分钟」按钮带独特白字，模板匹配特征足够独特：对局页、结算页、
+    弹窗都不会命中，所以命中即可认为当前正处于可发起对局的界面。
+    按钮必然在屏幕下半部，命中位置偏上视为误匹配。
+    """
+    img = img if img is not None else grab()
+    if img is None:
+        return None
+    if ARENA_TPL[0] is None:
+        _app_dir = os.path.dirname(os.path.abspath(__file__))
+        tpl_path = os.path.join(_app_dir, "templates", "arena_10.png")
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            cand = os.path.join(exe_dir, "templates", "arena_10.png")
+            tpl_path = cand if os.path.exists(cand) else tpl_path
+            meipass = getattr(sys, "_MEIPASS", None)
+            if not os.path.exists(tpl_path) and meipass:
+                tpl_path = os.path.join(meipass, "templates", "arena_10.png")
+        t = cv2.imread(tpl_path)
+        if t is None:
+            print("[开局] 缺少模板 templates/arena_10.png，无法自动点场次")
+            ARENA_TPL[0] = False
+        else:
+            ARENA_TPL[0] = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY)
+    tg = ARENA_TPL[0]
+    if tg is None or tg is False:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    best = None
+    for sc in (0.9, 1.0, 1.1):
+        t = cv2.resize(tg, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+        if t.shape[0] >= gray.shape[0] or t.shape[1] >= gray.shape[1]:
+            continue
+        m = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, loc = cv2.minMaxLoc(m)
+        if best is None or mx > best[0]:
+            best = (mx, loc, t.shape[1] // 2, t.shape[0] // 2)
+    if not best or best[0] < min_score:
+        return None
+    mx, loc, hw, hh = best
+    if loc[1] + hh < img.shape[0] * 0.6:   # 场次按钮只在屏幕下部
+        return None
+    return loc[0] + hw, loc[1] + hh
+
+
+ARENA_CLICK_T = [0.0]    # 上次点场次按钮的时间，防连点
+
+
+def start_arena_game(img):
+    """开始界面点「10分钟场」发起匹配。返回 True=当前是开始界面（已处理/刚点过）。
+
+    点完不等待：匹配中画面会变化，主循环的"等待棋局"分支自然接管。
+    执子方不指定——匹配是真实随机的，开局后由朝向/先手信号自动判定。
+    """
+    btn = find_arena_10(img)
+    if btn is None:
+        return False
+    if time.time() - ARENA_CLICK_T[0] < 8.0:
+        return True             # 刚点过，等界面响应，别连点
+    ARENA_CLICK_T[0] = time.time()
+    x, y = int(btn[0]), int(btn[1])
+    print(f"\n[开局] 开始界面点「10分钟场」({x},{y})，匹配随机先后手", flush=True)
+    click_point(x, y)
+    return True
 
 
 def find_close_x(img=None):
@@ -579,10 +897,21 @@ def click_next_game(attempts=3, gap=1.5):
     """
     ok_fens = {INITIAL_FEN, flipped_initial()}
     for k in range(attempts):
-        # 绿色按钮找不到时，多半是广告/奖励弹窗压在上面，先关弹窗再找
+        # 绿色按钮找不到时有两种可能，处置方式完全相反，必须先分清：
+        #   a) 广告/奖励弹窗压在上面（特征是画面变暗）→ 关弹窗；
+        #   b) 上一次点击已生效、结算页关闭、正在进匹配（画面正常）→ 停手。
+        # 以前不分青红皂白就 dismiss_popup()，它会按返回键，把刚发起的
+        # 匹配页直接退出去，接着又在非结算页上按配置坐标乱点，越搞越糟。
         if k >= 1 and green_button() is None:
-            print("[结算框] 没找到按钮，尝试关闭弹窗")
-            dismiss_popup()
+            img0 = grab()
+            dark = (img0 is not None
+                    and float(img0.mean()) < POPUP_BRIGHT_RATIO * popup_baseline[0])
+            if dark:
+                print("[结算框] 疑似弹窗遮挡，先关弹窗")
+                dismiss_popup()
+            else:
+                print("[结算框] 结算页已消失（应已进入匹配），停止点击")
+                return True
         elif k == 0:
             time.sleep(1.0)      # 给结算动画留点时间
         btn = green_button()
@@ -603,20 +932,66 @@ def click_next_game(attempts=3, gap=1.5):
         # 不再干等固定 1.5s：新局界面一出现就返回（截图只要 ~10ms，
         # 轮询比固定 sleep 快，动画播完即可进入下一局）
         deadline = time.time() + gap + 1.5
-        started = False
         while time.time() < deadline:
             if sleep_check(0.3): return False
             if green_button() is None:      # 结算按钮已消失 -> 不在结算页了
                 _, _, b = snapshot(tries=1)
                 if b is not None and to_fen(b) in ok_fens:
-                    started = True
-                    break
-        if started:
-            print("[结算框] 新对局已开始（初始局面确认）")
-            return True
+                    print("[结算框] 新对局已开始（初始局面确认）")
+                    return True
+                # 按钮没了但子还没摆好 = 正在匹配/摆子。这同样算成功：
+                # 继续在这儿等初始局面会白等（匹配可能要几十秒），而主循环
+                # 本来就有"等待棋局"分支接管，不该在这一直点。
+                print("[结算框] 结算页已关闭，等待摆子")
+                return True
         if k == 0:
             print("[结算框] 结算动画未播完或点击未生效，快速重试...")
     print("[结算框] 多次尝试未能开始新局")
+    return False
+
+
+END_CHECK_T = [0.0]      # 上次扫「再来一局」按钮的时间
+END_HITS = [0]           # 连续扫到绿色按钮的次数
+
+
+def try_settlement(img, force=False):
+    """周期性扫「再来一局」按钮，命中两次就开新局。返回 True=已开新局。
+
+    force=True 跳过"间隔"和"连中两次"两道限制立刻扫一次。给僵局熔断用：
+    那时 bot 正在结算动画期的残影上反复点棋盘，等不到下一轮常规扫描。
+
+    结算页必须主动扫，靠"读不到棋盘"来触发是不够的，而且会漏：
+      - 有时结算页上棋盘还在（终局局面），校验照样通过 → bot 当成对局中，
+        在结算页上反复尝试走子，卡死不动；
+      - 有时结算页把棋盘缩小上移，冻结标定读出来是垃圾 → 走"等待态"分支
+        静默等待，同样永远轮不到结算检测。
+    两种路径都会经过这里，所以放在两处都调用。
+
+    连中两次才动手：green_button 是纯颜色判定，对局界面偶尔有绿色元素，
+    误报一次就要跑 click_next_game 的十次尝试（约 30 秒）。
+    """
+    if not AUTO_NEXT:
+        return False
+    now = time.time()
+    if not force and now - END_CHECK_T[0] < END_CHECK_GAP:
+        return False
+    END_CHECK_T[0] = now
+    try:
+        # 收紧条件只在主动扫描时用：结算按钮面积几百到一千五、位置很靠下。
+        # 实测对局界面的绿色元素面积能到 5000+ 且位置偏上，不卡这两条就会
+        # 在对局中误判成结算页，连点好几下干扰对局。
+        btn = green_button(img, min_area=400, max_area=2600, min_y_ratio=0.82)
+    except Exception:
+        btn = None
+    END_HITS[0] = END_HITS[0] + 1 if btn is not None else 0
+    if not force and END_HITS[0] < 2:
+        return False
+    END_HITS[0] = 0
+    print("\n[结算] 检测到「再来一局」按钮，本局已结束", flush=True)
+    if click_next_game():
+        print("[结算] 新对局已开始")
+        return True
+    print("[结算] 点击未生效，继续尝试")
     return False
 
 
@@ -848,23 +1223,83 @@ def shutdown_engine():
         pass
 
 
-def main():
-    """包装一层：无论正常返回、异常还是被调用方中断，都收干净引擎进程。"""
+def log_run_header(backend):
+    """把这次运行的前提一次性写进日志（不进界面，界面地方有限）。
+
+    排查问题时最常缺的就是"当时到底用的什么配置"：有没有换过 App、标定是新的
+    还是旧的、模板是哪套、思考时间设了多少。这些在窗口关掉之后无从查起，
+    必须一开始就在文件里留底。
+    """
+    import glob as g
+    import logger
+    if not logger.path():
+        return
+    if CALIB:
+        kind = "仿射标定" if CALIB.get("affine") else "网格标定"
+        calib = f"{kind} cell={CALIB.get('cell_x', 0):.1f}x{CALIB.get('cell_y', 0):.1f}"
+    else:
+        calib = "无（每次自动拟合）"
     try:
+        pkg = current_package() or "(未取到)"
+    except Exception:
+        pkg = "(取包名失败)"
+    logger.header("运行开始", [
+        f"时间      {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"命令行    {' '.join(sys.argv)}",
+        f"执子      {MY_SIDE}{'（自动判定）' if AUTO_SIDE else ''}",
+        f"后端      {backend}",
+        f"当前 App  {pkg}",
+        f"标定      {calib}",
+        f"模板      {len(g.glob('templates/t_*.png'))} 个",
+        f"思考      {THINK_MS}ms  线程 {ENGINE_THREADS or '自动'}  哈希 {ENGINE_HASH}MB",
+        f"节奏      poll={POLL}/{POLL_IDLE}s  tap_gap={TAP_GAP}s  settle={MOVE_SETTLE}s",
+        f"开关      mumu_tap={MUMU_TAP}  自动下一局={AUTO_NEXT}",
+        f"日志文件  {logger.path()}",
+    ])
+    # 界面上也留一行：出问题时要知道该去翻哪个文件
+    print(f"日志文件: {logger.path()}")
+
+
+def main():
+    """包装一层：无论正常返回、异常还是被调用方中断，都收干净引擎进程。
+
+    顺便在这层装日志——_sys.stdout 一进来就被接管，之后每一步都落盘。
+    uninstall 放在最后：收引擎时万一有异常打印，也还能记进文件。
+    """
+    import logger
+    try:
+        logger.install()
         return _main_impl()
     finally:
-        shutdown_engine()
+        try:
+            shutdown_engine()
+        finally:
+            logger.uninstall()
 
 
 def _main_impl():
-    global REC, ENGINE, MY_SIDE
+    global REC, ENGINE, MY_SIDE, SIDE_LOCK, AUTO_SIDE
     mode = sys.argv[1] if len(sys.argv) > 1 else "watch"
     dry = "--dry" in sys.argv
     if "--black" in sys.argv:
-        MY_SIDE = "black"
+        MY_SIDE, AUTO_SIDE = "black", False
     elif "--red" in sys.argv:
-        MY_SIDE = "red"
+        MY_SIDE, AUTO_SIDE = "red", False
+    for _a in sys.argv:
+        if _a.startswith("--side="):
+            _v = _a.split("=", 1)[1].lower()
+            if _v == "auto":
+                AUTO_SIDE = True
+            else:
+                MY_SIDE = "black" if _v == "black" else "red"
+                AUTO_SIDE = False
+    # 界面/GUI 每次启动都是新一轮 runtime：上一轮锁定的执子方不能带过来
+    SIDE_LOCK = None
+    SIDE_FLIPS[0] = 0
+    SIDE_GUESS[0] = False
+    MISS_STAT["move"], MISS_STAT["count"] = None, 0
     print(f"执{'红（先手）' if MY_SIDE == 'red' else '黑（后手）'}"
+          f"{'（自动判定，开局后确认）' if AUTO_SIDE else ''}"
           f"   棋盘朝向将按红帅位置自动摆正")
 
     hit = init_backend()
@@ -872,6 +1307,7 @@ def _main_impl():
         print("既没有可用的 adb 设备，也找不到游戏窗口")
         return 1
     print(f"后端就绪: {hit}")
+    log_run_header(hit)
     # 每次运行都读一次最新标定：GUI 是同进程反复跑 main()，只靠 import 时
     # 加载的话，重新标定后跑 auto 用的还是旧标定。
     reload_calib()
@@ -906,6 +1342,7 @@ def _main_impl():
     elif mode == "auto":
         print("auto 模式：红方自动对弈，Ctrl+C 退出")
         expect = None          # 我方走完后的期望局面
+        pre_move_sig = None    # 我方落子**前**的局面，用来分辨"没生效"vs"对手走了"
         state = "boot"         # boot -> my_turn -> wait_opp -> my_turn ...
         last_sig, stable = None, 0
         refusals = 0
@@ -917,6 +1354,12 @@ def _main_impl():
         # 上一帧 (img, loc, board, flip)，供画面未变时复用；flip 必须与 board
         # 一起带走，否则复用时会沿用旧朝向（见 snapshot 的 reuse 分支）
         prev_frame = None
+        wait_log = 0.0           # 上一次打"等待对方"的秒数，避免同 1 秒刷屏
+        wait_board_log = 0.0     # 上一次打"等待棋局"的秒数（匹配/摆子中）
+        wait_board_t0 = time.time()
+        end_check_t = 0.0        # 上次扫结算页按钮的时间
+        end_hits = 0             # 连续扫到绿色按钮的次数
+        opp_noise = 0            # 等对手时"变化不像一步棋"的连续次数
         clear_ponder()
         while True:
             # 连续读不到棋盘时打开 verbose，把失败原因（定位失败/校验不过的
@@ -926,10 +1369,56 @@ def _main_impl():
             if board is not None:
                 prev_frame = (img, loc, board, BOARD_FLIP)
             if board is None:
+                # 读不到棋盘的**任何**原因都可能是结算页：匹配中（真没棋盘）、
+                # 摆子中（空盘）、结算页把棋盘缩小上移（读出 K=0 k=2 这种
+                # 垃圾局面）。所以结算检测必须放在最前面，不能只挂在某一条
+                # 分支上——实测挂在后面会导致结算页一直识别不出来。
+                if try_settlement(img):
+                    expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
+                    SIDE_LOCK = None
+                    SIDE_FLIPS[0] = 0
+                    SIDE_GUESS[0] = False
+                    MISS_STAT["move"], MISS_STAT["count"] = None, 0
+                    WR_SMOOTHER.reset()
+                    last_sig, stable, boot_wait, prev_ok = None, 0, None, None
+                    prev_frame = None
+                    clear_ponder()
+                    if sleep_check(3): return 0
+                    continue
+                # 开始界面（场次选择页）：主动点「10分钟场」发起对局。
+                # 放在空盘等待之前——开始界面同样读不到棋盘，但那不是
+                # "匹配中"，不点的话 bot 会一直干等。
+                if start_arena_game(img):
+                    weird = 0
+                    if sleep_check(POLL_IDLE): return 0
+                    continue
+                # 匹配中 / 摆子中：画面上根本没有完整棋局。这是每局必经的
+                # 阶段，不是异常——安静等就行。旧代码照样累加 weird 并打点，
+                # 攒够 8 次还会去跑结算页检测，每次续局空转几十秒。
+                if is_empty_board_wait():
+                    if wait_board_log == 0.0:
+                        wait_board_log = time.time()
+                        print("\n[等待] 未识别到棋局（匹配/摆子中），静默等待…",
+                              flush=True)
+                    elif time.time() - wait_board_log >= 15:
+                        wait_board_log = time.time()
+                        print(f"\n[等待] 仍未识别到棋局 "
+                              f"({time.time() - wait_board_t0:.0f}s)",
+                              flush=True)
+                    # 不累加 weird：这里不是"局面异常"，不该触发结算页检测
+                    weird = 0
+                    if sleep_check(POLL_IDLE): return 0
+                    continue
+                wait_board_log, wait_board_t0 = 0.0, time.time()
                 weird += 1
                 print(".", end="", flush=True)
                 if weird >= 8 and handle_possible_game_end(img, weird):
                     expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
+                    SIDE_LOCK = None      # 新局重新判定先后手
+                    SIDE_FLIPS[0] = 0
+                    SIDE_GUESS[0] = False
+                    MISS_STAT["move"], MISS_STAT["count"] = None, 0
+                    WR_SMOOTHER.reset()   # 胜率别带着上一局的值
                     last_sig, stable, boot_wait, prev_ok = None, 0, None, None
                     prev_frame = None
                     clear_ponder()
@@ -954,6 +1443,10 @@ def _main_impl():
                               f"state={state} 当前={sig[:34]}...", flush=True)
                     if weird >= 12 and handle_possible_game_end(img, weird):
                         expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
+                        SIDE_LOCK = None      # 新局重新判定先后手
+                        SIDE_FLIPS[0] = 0
+                        SIDE_GUESS[0] = False
+                        MISS_STAT["move"], MISS_STAT["count"] = None, 0
                         last_sig, stable, boot_wait, prev_ok = None, 0, None, None
                         prev_frame = None
                         clear_ponder()
@@ -963,10 +1456,45 @@ def _main_impl():
                     continue
             weird = 0
             prev_ok = sig
+            # 结算页必须主动查，见 try_settlement 的说明
+            if try_settlement(img):
+                expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
+                SIDE_LOCK = None      # 新局重新判定先后手
+                SIDE_FLIPS[0] = 0
+                SIDE_GUESS[0] = False
+                MISS_STAT["move"], MISS_STAT["count"] = None, 0
+                WR_SMOOTHER.reset()   # 胜率别带着上一局的值
+                last_sig, stable, boot_wait, prev_ok = None, 0, None, None
+                prev_frame = None
+                clear_ponder()
+                if sleep_check(3): return 0
+                continue
             if img is not None:
                 # 更新正常画面亮度基线（弹窗检测的参照）
                 popup_baseline[0] = popup_baseline[0] * 0.9 + float(img.mean()) * 0.1
-            if state == "boot" and sig == INITIAL_FEN:
+            if AUTO_SIDE and SIDE_LOCK is None and state == "boot" \
+                    and not SIDE_GUESS[0]:
+                # 先验：这类 App 通常把我方的棋子摆在屏幕下方。board 已归一化成
+                # "红在下"，flip=True 意味着屏幕上是"红在上、黑在下" -> 我执黑。
+                # 只是先验，真正定案看下面"开局谁先落子"（红先手，规则级信号）。
+                #
+                # 只定一次（SIDE_GUESS）：原来每帧强行按朝向改判，于是开局期
+                # 出现"朝向判黑 -> 观察期满判红 -> 下一帧朝向又把红改回黑"的
+                # 拉锯（实测 5 秒内改判 3 次）。朝向只是弱先验，不能反复推翻
+                # 更强的规则级信号，定完就交给后面的判据修正。
+                guess = "black" if BOARD_FLIP else "red"
+                SIDE_GUESS[0] = True
+                if MY_SIDE != guess:
+                    apply_side(guess, "棋盘朝向（我方通常在屏幕下方）")
+            if state == "boot" and is_initial_position(sig):
+                # 初始局面（32 子一步未走）只会出现在新局。上一局锁定的执子方
+                # 在这里必须作废——否则会带着上一局的"执黑"进入红先手的新局，
+                # 抢在对手前面落子，连点 4 次不生效后停机（实战 21:31 那次）。
+                if SIDE_LOCK is not None:
+                    SIDE_LOCK = None
+                    SIDE_FLIPS[0] = 0
+                    SIDE_GUESS[0] = False
+                    print("[开局] 初始局面：作废上一局锁定的执子方，重新判定")
                 # 新局可能轮到黑方先行，先观察 BOOT_WAIT 秒再动手。
                 # 期间只要对手落子（局面变化），下一帧 sig 就不再是初始局面，
                 # 条件不成立 -> 直接落到 my_turn 出手（此时正好轮到红）。
@@ -978,9 +1506,59 @@ def _main_impl():
                 if time.time() - boot_wait < BOOT_WAIT:
                     if sleep_check(POLL): return 0
                     continue
+                # 观察期满对手还没动。这里**不能一律判红抢走**：朝向先验若判
+                # 我方执黑，那我是后手，对手（人类）思考十几秒再落子很正常，
+                # 照老逻辑 2.5s 就改判红、抢在对手前面落子 —— 实战里表现为
+                # "执黑时开局乱点/不响应"。所以：判黑就继续耐心等到
+                # BOOT_PATIENCE，届时对手仍无动作，才认定朝向先验错了、改判红。
+                if AUTO_SIDE and SIDE_LOCK is None:
+                    if MY_SIDE == "black" and \
+                            time.time() - boot_wait < BOOT_PATIENCE:
+                        if sleep_check(POLL_IDLE): return 0
+                        continue
+                    apply_side("red",
+                               f"开局 {BOOT_PATIENCE:g}s 内对手未落子 → 我方先手")
+            elif AUTO_SIDE and SIDE_LOCK is None and state == "boot":
+                # boot 状态下局面不是初始局面 -> 推断是对手先走了。
+                # 但这条**只在真开局成立**：bot 在中途重启时看到的也是"非初始
+                # 局面"（那是它自己走过若干步的结果），照这条推断就会误判成
+                # 执黑，于是 FEN 写成黑走，引擎拒局（实测 side=b 无 bestmove），
+                # 表现为每步卡 8 秒后放弃。所以必须卡子数。
+                n_now = sum(1 for v in board.values()
+                            if (v[0] if isinstance(v, tuple) else v))
+                if n_now >= 28:
+                    apply_side("black", "开局对手已先落子")
             boot_wait = None
             if state == "wait_opp":
+                if pre_move_sig and sig == pre_move_sig:
+                    # 局面退回我方落子之前 —— 这是"上一手没生效"，不是对手走棋。
+                    # 坑在于：未生效时 expect(理论落子后) 与实际局面正好差 2 格，
+                    # is_single_move 会当成一步棋通过，于是 bot 认定"对手应了
+                    # 一手"、接着再走同一手，每 3 秒一次无限循环（实测卡死 30+ 手）。
+                    MISS_STAT["count"] = MISS_STAT.get("count", 0) + 1
+                    print(f"\n[未生效] 局面回到落子前，我方上一手未生效"
+                          f"（连续 {MISS_STAT['count']} 次），重走", flush=True)
+                    expect, last_sig, stable = None, None, 0
+                    prev_frame = None
+                    state = "my_turn"
+                    if sleep_check(POLL): return 0
+                    continue
                 if sig != expect:
+                    # 变化必须确实是"一步棋"才能认定对手走了。
+                    # expect 是落子后按理论推算的 FEN，实测帧总有 1~2 格出入
+                    # （模板匹配在动画/高亮下会抖），只判 sig != expect 的话
+                    # 噪声就被当成对手落子，bot 于是自己接着走——日志里出现
+                    # 过 2~3 秒连走三手的自战。噪声连续多次才让步，避免
+                    # expect 本身错了导致永久僵死。
+                    if expect and not is_single_move(expect, sig):
+                        opp_noise += 1
+                        if opp_noise == 1:
+                            print("\n[等待] 局面有变化但不像一步棋，"
+                                  "按识别噪声处理", flush=True)
+                        if opp_noise <= 6:
+                            if sleep_check(POLL): return 0
+                            continue
+                    opp_noise = 0
                     # 对方走了。先看是否命中后台预搜索：命中就直接取用结果，
                     # 未命中也只多一次停止往返，随后照常冷启动搜索。
                     if PONDER["move"] and ENGINE is not None and ENGINE.pondering:
@@ -1005,9 +1583,11 @@ def _main_impl():
                             print(f"[ponder] 累计命中 {h}/{t} = {h / t * 100:.0f}%"
                                   f"（命中则省掉 {THINK_MS}ms 搜索）")
                     state, wait_start = "my_turn", None          # 对方走了
+                    advice.forget_diff()   # 对手这一步可能吃子，子力差跳变合法
                 else:
                     if wait_start is None:
                         wait_start = time.time()
+                        wait_log = 0.0
                     waited = time.time() - wait_start
                     # 看门狗：安静等待，但超过 WAIT_MAX 就认定"我方上一手没生效"，
                     # 强制重新分析，避免永久僵死
@@ -1017,23 +1597,100 @@ def _main_impl():
                         state, wait_start = "my_turn", None
                         if sleep_check(POLL): return 0
                         continue
-                    if int(waited) % 20 == 0 and int(waited) > 0:
-                        print(f"\n[等待对方 {waited:.0f}s] 当前 {sig[:28]}...", flush=True)
+                    # waited 落在 20.0~20.9 这一整秒里每个采样都会满足条件，原来
+                    # 直接按 int(waited) % 20 判断，同一秒能刷出七八条同样的日志。
+                    if waited - wait_log >= 20:
+                        wait_log = waited
+                        print(f"\n[等待对方 {waited:.0f}s] 当前 {sig[:28]}...",
+                              flush=True)
                     # 画面静止期降频采样：等待可能持续几十秒，没必要 25Hz
                     if sleep_check(POLL_IDLE): return 0
                     continue
             if state in ("boot", "my_turn"):
                 print(f"\n[{time.strftime('%H:%M:%S')}] 轮到我方")
+                pre_move_sig = sig          # 落子前的局面，用于事后分辨"没生效"
                 status, fen_after = play_once_prepared(board, loc, dry=dry)
                 if status == "ok":
                     expect, refusals = fen_after, 0
                     stales = 0
+                    MISS_HEAL[0] = 0       # 走出去了，之前未生效的自愈计数归零
                     state = "wait_opp"
+                    # 我方这一手可能吃子，子力差跳 400+ 是正常的，别让守门员
+                    # 把紧随其后的深搜极端评估（真杀势）当成错帧拦掉。
+                    advice.forget_diff()
+                    opp_noise = 0       # 新的一轮等待，噪声计数归零
+                    # 首手真正落定且画面确认了 => 执子方判断成立，锁住不再改。
+                    # 没确认落到新格的（只差动画）不算验证过，留待下一手。
+                    if AUTO_SIDE and SIDE_LOCK is None and CONFIRMED[0]:
+                        apply_side(MY_SIDE, "首手落子已确认生效", lock=True)
+                elif status == "miss":
+                    # 走子请求发出去了，但棋子没离开起点。这里绝对不能直接把
+                    # "理论上的落子后局面"当成新局面（旧代码正是这么做，于是
+                    # 下一轮照着同一个 false expectation 再发一次同手，最多见过
+                    # 同一手连点 8 次）。静置一下让 App 的动画/状态机收尾，
+                    # 重新全盘识别后再试；连续不成则怀疑执子方判反，自动换边。
+                    last_sig, stable = None, 0
+                    prev_frame = None
+                    cnt = MISS_STAT["count"]
+                    if SIDE_FLIPS[0] >= 3:
+                        # 熔断：换边三次都落不下子，几乎可以肯定不在对局页。
+                        # 继续换边只会红↔黑无限横跳（实测 20:52 起卡了整整
+                        # 一分钟、每 3 秒重发同一手）。停手处理页面本身。
+                        print(f"\n[僵局] 执子方已换边 {SIDE_FLIPS[0]} 次仍无法落子，"
+                              f"判定不在对局页：关弹窗 + 强制扫结算页", flush=True)
+                        dismiss_popup()
+                        if try_settlement(img, force=True):
+                            expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
+                            SIDE_LOCK = None
+                            SIDE_FLIPS[0] = 0
+                            SIDE_GUESS[0] = False
+                            MISS_STAT["move"], MISS_STAT["count"] = None, 0
+                            WR_SMOOTHER.reset()
+                            last_sig, stable, boot_wait, prev_ok = None, 0, None, None
+                            prev_frame = None
+                            clear_ponder()
+                            if sleep_check(3): return 0
+                            continue
+                        print("\n[僵局] 已停止（页面既非对局页也扫不到结算页，"
+                              "请把模拟器停在对局或开始界面后重启）")
+                        return 1
+                    if AUTO_SIDE and SIDE_LOCK is None and cnt >= 2:
+                        other = "black" if MY_SIDE == "red" else "red"
+                        apply_side(other, f"同一手连续 {cnt} 次未生效，执子方可能判反")
+                        MISS_STAT["count"] = 0
+                        expect, boot_wait = None, None
+                        state = "boot"
+                    elif cnt >= 4:
+                        # 直接停机太可惜：绝大多数情况是"并非我方回合"（对手
+                        # 还没走完 / 刚进新局抢跑了）或被弹窗挡住，退回去重判
+                        # 就能自愈。所以先自愈两轮，攒到 8 次才认输停机。
+                        print(f"\n同一手连续 {cnt} 次未能落子：可能是弹窗挡住或"
+                              f"并非我方回合，先自愈（关弹窗+复位+重判）")
+                        dismiss_popup()
+                        neutral_tap(loc)
+                        MISS_STAT["move"], MISS_STAT["count"] = None, 0
+                        MISS_HEAL[0] += 1
+                        expect, boot_wait = None, None
+                        prev_frame = None
+                        clear_ponder()
+                        state = "boot"
+                        if MISS_HEAL[0] >= 3:
+                            print("\n自愈无效（已重试 3 轮）：可能是 App 结算/"
+                                  "弹窗挡住，或当前并非我方回合。已停止。")
+                            return 1
+                    else:
+                        state = "boot" if not expect else "wait_opp"
+                    if sleep_check(1.0): return 0
+                    continue
                 elif status == "mate":
                     # 引擎确认将死（应用无关信号），直接开下一局
                     print("[终局] 自动开下一局")
                     if AUTO_NEXT and click_next_game():
                         expect, state, weird, refusals, stales = None, "boot", 0, 0, 0
+                        SIDE_LOCK = None      # 新局重新判定先后手
+                        SIDE_FLIPS[0] = 0
+                        SIDE_GUESS[0] = False
+                        MISS_STAT["move"], MISS_STAT["count"] = None, 0
                         last_sig, stable, boot_wait, prev_ok = None, 0, None, None
                         prev_frame = None
                         clear_ponder()
@@ -1041,6 +1698,14 @@ def _main_impl():
                         continue
                     print("已停止（点击再来一局失败）")
                     return 1
+                elif status == "end":
+                    # 画面已是结算页（落子前复核发现的）：这不是"落子失败"，
+                    # 绝不能计入 refusals（攒够 5 次会直接停机）。重置状态
+                    # 回到主循环，由结算检测去点「再来一局」。
+                    last_sig, stable, stales = None, 0, 0
+                    prev_frame = None
+                    if sleep_check(POLL): return 0
+                    continue
                 elif status == "stale":
                     # 局面在分析期间变了，下一轮用最新局面重新分析，不计失败。
                     # 但"复核一直不过"必须封顶：它不计入 refusals，会变成引擎
@@ -1060,6 +1725,16 @@ def _main_impl():
                               "          ③ 当前不在对局界面。已停止。")
                         return 1
                 else:
+                    if FORCE_RESNAP[0]:
+                        # 引擎拒局几乎都是喂进了非法局面（识别噪声/动画残影），
+                        # 不是真的落子失败。丢掉复用帧强制全量重识别，且不计数
+                        # ——算进 refusals 攒够 5 次会误停机（实战拒局 5 次）。
+                        FORCE_RESNAP[0] = False
+                        prev_frame = None
+                        last_sig, stable = None, 0
+                        state = "boot"
+                        if sleep_check(POLL): return 0
+                        continue
                     refusals += 1
                     if refusals >= 5:
                         print("\n连续多次无法落子：可能对局已结束、轮次判断出错"
@@ -1084,20 +1759,78 @@ def play_once_prepared(board, loc, dry=False):
     print(board_diagram(board))
     fen = fen0 + f" {'w' if MY_SIDE == 'red' else 'b'} - - 0 1"
 
-    # 若上一轮后台预搜索命中，结果已经算好了，直接取用——省掉整段搜索时间
+    # 阶段判定 -> 残局要换策略：加时 + 优先找杀
+    ph, ph_txt = advice.phase(board)
+    endgame = (ph == "end")
+    think_ms = advice.endgame_think_ms(board, THINK_MS)
+    print(f"局面 {ph_txt}"
+          + (f" → 残局模式，思考加时到 {think_ms}ms" if think_ms != THINK_MS else ""))
+
     bm, res = None, None
-    if PENDING[0] is not None:
+
+    # 残局第一优先：找强制杀。常规"当前最优"搜索在残局常常给出看似不错、
+    # 却赢不下来的着法（兑子是它的最爱），有杀时按杀走才是破解之道。
+    if endgame and not dry:
+        got = advice.find_forced_mate(ENGINE, fen, depth=MATE_SEARCH_DEPTH)
+        if got:
+            bm, mate_in, res = got
+            print(f"★ 残局发现 {mate_in} 步强制杀：{bm}")
+
+    # 若上一轮后台预搜索命中，结果已经算好了，直接取用——省掉整段搜索时间
+    if bm is None and PENDING[0] is not None:
         pend_bm, pend_res, pend_fen = PENDING[0]
         PENDING[0] = None
         if pend_fen == fen0:
             bm, res = pend_bm, pend_res
-            print(f"[ponder] 沿用后台搜索结果，跳过 {THINK_MS}ms 搜索")
+            print(f"[ponder] 沿用后台搜索结果，跳过 {think_ms}ms 搜索")
         else:
             print("[ponder] 局面与后台搜索不符，作废改走正常搜索")
 
     if bm is None:
-        bm, res = ENGINE.analyse(fen, movetime=THINK_MS)
-    info = res["info"]
+        bm, res = ENGINE.analyse(fen, movetime=think_ms)
+    # 引擎拒局的兜底：走子方写反时引擎会**静默不出着法**（既不报错也不返回），
+    # 于是每次白等超时上限（约 8 秒）。这里翻过来再试一次——能出着法就说明
+    # 执子方判反了，顺势修正，别让整局卡死在这一步。
+    if bm is None and not dry and ENGINE is not None:
+        mine_ch = "w" if MY_SIDE == "red" else "b"
+        alt_ch = "b" if mine_ch == "w" else "w"
+        try:
+            bm_alt, res_alt = ENGINE.analyse(fen0 + f" {alt_ch} - - 0 1",
+                                             movetime=think_ms, retries=0,
+                                             timeout=2.0)
+        except Exception:
+            bm_alt = None
+        if bm_alt:
+            other = "black" if MY_SIDE == "red" else "red"
+            # 改判只在**开局完整局面**下才可信。中局的拒局绝大多数不是走子方
+            # 写反，而是局面特殊——最典型的就是我方已被将死（无合法着法，引擎
+            # 静默不响应），此时翻转成对方走当然能出着，据此把执子方改成对方
+            # 纯属误导（实战日志：21:24:10 在已被将死的残局上把正确的黑改判成
+            # 红）。真·开局期执子方未定案时，这条才救得了场。
+            n_piece = sum(1 for v in board.values()
+                          if (v[0] if isinstance(v, tuple) else v))
+            if SIDE_LOCK is None and n_piece >= 28:
+                # 执子方还没定案（开局）：翻转就能出着 = 之前判反了，顺势改判。
+                bm, res = bm_alt, res_alt
+                print(f"[走子方] 引擎拒局，翻转成 {alt_ch} 后出着 -> 执子方应为 "
+                      f"{other}（原判 {MY_SIDE}）")
+                apply_side(other, "引擎拒局翻转后出着", lock=True)
+            else:
+                # 执子方已定案、或非开局局面：拒局几乎都是将死/困毙、引擎瞬时
+                # 问题或识别噪声，不是走子方写反（实测照旧改判会把正确的红翻成
+                # 黑，白白乱一手、8 秒后才被朝向先验纠正）。不采用翻转出来的
+                # 着法（那是对方视角），本轮放弃，下轮重新识别再算。
+                print(f"[走子方] 引擎拒局（{n_piece} 子"
+                      f"{'，执子方已锁定' if SIDE_LOCK else '，非开局局面'}"
+                      f"）：多半是将死/困毙或识别噪声，不改判，本轮放弃")
+                FORCE_RESNAP[0] = True
+                bm = None
+    # 拒局时 res/info 可能残缺，统一兜成 dict，别让 .get 抛异常
+    info = (res or {}).get("info") or {}
+
+    # 胜率：走子方是我方，所以不需翻转。这行同时给界面和日志用，
+    # 界面认 "胜率:" 前缀。真正的深搜胜率在落子后的等待期另算。
+    report_winrate(info, board, flip=False, tag=f"{ph_txt} ")
     print(f"引擎建议: {bm}  ({info.get('depth', '?')}层)  走 {bm}")
     # 我方被将死/困毙：引擎返回 (none) + mate 0
     if bm in (None, "(none)") and info.get("scoretype") == "mate":
@@ -1119,6 +1852,13 @@ def play_once_prepared(board, loc, dry=False):
         loc_f = bl.locate_with_calib(img_f, CALIB) or bl.locate_board(img_f)
     if loc_f is None:
         return "stale", None
+    # 结算页上棋盘会被缩小上移，但**冻结标定是固定坐标、不校验内容**，
+    # 于是定位照样"成功"、复核会假通过，bot 就在结算页上一直点（实测
+    # 连点 3 次未生效、白白耗掉 70 秒才等到结算检测轮到）。这里按结算页
+    # 的收紧判据再挡一道，命中就交回主循环走"再来一局"。
+    if green_button(img_f, min_area=400, max_area=2600, min_y_ratio=0.82):
+        print("落子前复核：画面已是结算页，放弃本轮点击")
+        return "end", None
     # 复核与点击都发生在屏幕坐标系上，必须用 raw_cell 还原朝向
     r_src, r_dst = raw_cell(src), raw_cell(dst)
     chk = REC.recognize_cells(img_f, loc_f, [r_src, r_dst])
@@ -1130,6 +1870,13 @@ def play_once_prepared(board, loc, dry=False):
         print(f"局面在分析期间已变化（起点={a_p} 终点={d_p}），放弃本轮点击")
         return "stale", None
     loc = loc_f
+
+    # 这一手上一轮没走成：先把 UI 的选中/落子状态机拉回中性，再重走。
+    # 少了这一步，第二次同样的两次点击会把上一次实际已到位的子重新选中、
+    # 走回原地（见 MISS_STAT 的注释）——日志里出现过同一手连点 8 次。
+    if MISS_STAT["move"] == bm and MISS_STAT["count"] >= 1:
+        if neutral_tap(loc):
+            print("[UI复位] 上一次同一手未生效，先点空白取消可能的选中残留")
 
     click_point(*loc["points"][r_src])
     time.sleep(TAP_GAP)
@@ -1157,15 +1904,34 @@ def play_once_prepared(board, loc, dry=False):
         # 起点空 + 终点有子 = 动画确实落定
         if s2p is None and d2p is not None:
             print("落子确认生效")
+            CONFIRMED[0] = True
+            MISS_STAT["move"], MISS_STAT["count"] = None, 0
             break
         if time.time() >= deadline:
             # 判定标准：起点变空 = 棋子确实离开了 = 落子生效。
             # 动画中间帧会让"起点/终点都显得空"，此时不能判失败；
             # 真正失败的特征是棋子仍留在起点。
             if s2p is not None and d2p is None:
+                # 以前这里只打一行字然后照样返回 ok，上层于是把"理论上的
+                # 落子后局面"当成实际局面，下一轮又重放同一手，形成死循环。
+                # 现在明确返回 miss，交给上层决定是否先静置 / 换边。
                 print(f"!! 落子可能未生效（棋子仍在起点 {s2p}）")
-            else:
-                print("落子确认：动画未完全落定，交下一轮校验")
+                CONFIRMED[0] = False
+                MISS_STAT["move"] = bm
+                MISS_STAT["count"] = MISS_STAT.get("count", 0) + 1
+                return "miss", None
+            # 到 deadline 还确认不了，说明不是普通动画延迟。以前这里照样
+            # break 出去当成功返回，上层于是把"理论落子后局面"当真，下一轮
+            # 照着这个假期望再发同一手——实测每 3 秒一次、无限循环。
+            # 连续 2 次确认不了就按未生效处理，交给上层换边/静置。
+            MISS_STAT["move"] = bm
+            MISS_STAT["count"] = MISS_STAT.get("count", 0) + 1
+            if MISS_STAT["count"] >= 2:
+                print(f"!! 连续 {MISS_STAT['count']} 次无法确认落子，按未生效处理")
+                CONFIRMED[0] = False
+                return "miss", None
+            print("落子确认：动画未完全落定，交下一轮校验")
+            CONFIRMED[0] = False
             break
     # 绝杀检测（与应用无关）：走完后看对方是否已无路可走
     # 必须补全走子方字段，否则引擎拿到残缺 FEN 会静默保持旧局面
@@ -1173,6 +1939,16 @@ def play_once_prepared(board, loc, dry=False):
     if not dry and opponent_mated(f"{fen_expect} {side_after} - - 0 1"):
         print("★ 绝杀！对方已无路可走，本局获胜")
         return "mate", fen_expect
+
+    # 落子后、ponder 之前做一次深度评估。必须卡在这个位置：
+    #   - 在绝杀检测之后：绝杀已定胜负，没必要再评估；
+    #   - 在 ponder 之前：analyse 会中止后台搜索，放后面就把 ponder 冲掉了。
+    # 此刻轮到对手走，引擎给出的是对手视角分数，内部会翻转成我方胜率。
+    if not dry:
+        b_after = dict(board)
+        b_after.pop(src, None)
+        b_after[dst] = board.get(src)
+        deep_eval_on_wait(fen_expect, b_after, opp_to_move=True, dry=dry)
 
     # 绝杀检测要用引擎，必须放在 ponder 之前——否则它会把后台搜索打断。
     # 我方落子后对手还在思考，这段时间正好让引擎按预测应手继续往下搜。
@@ -1192,6 +1968,14 @@ def play_once_prepared(board, loc, dry=False):
 
 
 if __name__ == "__main__":
+    # 被 WinUI 3 界面当子进程调用时，stdout 是管道：Python 会切成块缓冲，
+    # 界面上就表现为"日志半天不刷一行"。强制行缓冲并统一 UTF-8。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(line_buffering=True, encoding="utf-8",
+                           errors="replace")
+        except Exception:
+            pass
     try:
         sys.exit(main())
     except KeyboardInterrupt:
